@@ -1,0 +1,350 @@
+#!/bin/bash
+# Backend for the Christian-Focus bar panel: saved YouTube songs, playlists
+# (imported from YouTube or made by hand) and channels, plus the starter
+# playlists in catalog.json, streamed audio-only through mpv. Every command
+# prints one line of JSON.
+#
+#   state                          player state (polled, so it stays cheap)
+#   library                        songs, playlists and channels
+#   catalog                        merge the starter playlists from catalog.json
+#   welcome [pl...]                finish the first-run card, deleting the listed starter playlists
+#   add <url>                      save a song to My Songs (a playlist link is imported instead)
+#   remove <song>                  remove a song from My Songs
+#   pl-new <name>                  create an empty playlist
+#   pl-import <url>                import a YouTube playlist
+#   pl-add <pl> <url>              add a song (or every song in a playlist) to a playlist
+#   pl-del <pl> <song>             remove a song from a playlist
+#   pl-sync <pl>                   pull new songs from the playlist's YouTube source
+#   pl-remove <pl>                 delete a playlist
+#   ch-add <url>                   save a channel (a video link saves its channel)
+#   ch-remove <ch>                 remove a channel
+#   play songs [song]              play My Songs, starting at <song>
+#   play playlist <pl> [song]      play a playlist, starting at <song>
+#   play channel <ch>              shuffle a channel's videos
+#   toggle | next | prev | stop    player controls; toggle with nothing playing resumes the last thing played
+
+lib="${CHRISTIAN_FOCUS_LIB:-$HOME/.config/omarchy/christian-focus.json}"
+run="${XDG_RUNTIME_DIR:-/tmp}"
+sock="$run/christian-focus.sock"
+ctx="$run/christian-focus.ctx"
+
+# Polled by the panel, so it comes first and stays cheap: no jq, and one
+# socket round trip for all player properties. The panel matches the playing
+# path to a song itself.
+state() {
+  local replies="" context=null
+  if [[ -S $sock ]]; then
+    replies=$(printf '%s\n' \
+      '{"command":["get_property","pause"],"request_id":1}' \
+      '{"command":["get_property","path"],"request_id":2}' \
+      '{"command":["get_property","time-pos"],"request_id":3}' \
+      '{"command":["get_property","duration"],"request_id":4}' \
+      '{"command":["get_property","media-title"],"request_id":5}' |
+      socat -t 0.05 - "$sock" 2>/dev/null)
+    [[ -f $ctx ]] && context=$(<"$ctx")
+  fi
+  printf '{"replies":[%s],"ctx":%s}\n' "${replies//$'\n'/,}" "${context:-null}"
+}
+[[ ${1:-state} == state ]] && { state; exit 0; }
+
+here=.
+[[ ${BASH_SOURCE[0]} == */* ]] && here=${BASH_SOURCE[0]%/*}
+catalog="$here/catalog.json"
+m3u="$run/christian-focus.m3u"
+lock="$run/christian-focus.lock"
+plock="$run/christian-focus.player.lock"
+
+ipc() { printf '%s\n' "$1" | socat - "$sock" 2>/dev/null; }
+running() { [[ -S $sock ]] && ipc '{"command":["get_property","pid"]}' | grep -q '"error":"success"'; }
+reply() { jq -cn --arg msg "$2" --argjson ok "$1" '{ok: $ok, message: $msg}'; }
+fail() { reply false "$1"; exit 0; }
+count_msg() { (($1 == 0)) && echo "Already added" || { (($1 == 1)) && echo "Added 1 song" || echo "Added $1 songs"; }; }
+SAVE_FAILED="Couldn't save your library ($lib)"
+
+# Read-modify-write the library under a lock; callers pass jq args + filter.
+# On failure (bad library, full disk) the library is left as it was.
+update_lib() {
+  local tmp rc=1
+  exec 9>"$lock"; flock 9
+  tmp=$(mktemp "$lib.XXXX") && jq "$@" "$lib" >"$tmp" && [[ -s $tmp ]] && mv "$tmp" "$lib" && rc=0
+  rm -f "$tmp"
+  flock -u 9
+  return $rc
+}
+
+video_id() { sed -nE 's/.*[?&]v=([A-Za-z0-9_-]{11}).*/\1/p; s#.*youtu\.be/([A-Za-z0-9_-]{11}).*#\1#p; s#.*/shorts/([A-Za-z0-9_-]{11}).*#\1#p' <<<"$1" | head -1; }
+list_id() { sed -nE 's/.*[?&]list=([A-Za-z0-9_-]+).*/\1/p' <<<"$1" | head -1; }
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+# YouTube "Mix" lists (RD…) are generated per viewer, so they are never
+# treated as playlists; only the song itself is kept.
+real_list() { local l; l=$(list_id "$1"); [[ -n $l && $l != RD* ]] && echo "$l"; }
+
+# Songs JSON array for a single video or a whole playlist, in YouTube's order.
+SONGS='[.[] | select(.id != null and .title != null and .title != "[Private video]" and .title != "[Deleted video]")
+        | {id, title, duration: (.duration // 0 | floor), url: "https://www.youtube.com/watch?v=\(.id)"}]
+       | to_entries | unique_by(.value.id) | sort_by(.key) | map(.value)'
+fetch_video() {
+  yt-dlp --no-playlist --print '%(.{id,title,duration})j' -- "https://www.youtube.com/watch?v=$1" 2>/dev/null | jq -sc "$SONGS"
+}
+fetch_playlist() { # prints {title, songs}
+  yt-dlp --flat-playlist --ignore-errors -J -- "https://www.youtube.com/playlist?list=$1" 2>/dev/null |
+    jq -c "{title: (.title // \"YouTube playlist\"), songs: (.entries // [] | $SONGS)}"
+}
+songs_from_url() { # any song or playlist link -> songs array
+  local url=$1 list vid
+  list=$(real_list "$url"); vid=$(video_id "$url")
+  if [[ -n $list ]]; then fetch_playlist "$list" | jq -c '.songs'
+  elif [[ -n $vid ]]; then fetch_video "$vid"
+  fi
+}
+
+# jq helper: `target` is My Songs when $pl is empty, else that playlist's songs.
+TARGET='def target: if $pl == "" then .items else (.playlists[] | select(.id == $pl) | .items) end;'
+pl_exists() { jq -e --arg id "$1" '.playlists | any(.id == $id)' "$lib" >/dev/null; }
+
+# Append songs to My Songs or a playlist, skipping ones already there and, when
+# syncing, ones the user removed from it. The count comes from a first read;
+# the write filters again under the lock, so a concurrent change can't cause
+# duplicates. Song lists go through files, not arguments, which the kernel
+# caps at 128 KiB. Prints how many were added.
+append_songs() { # <playlist id, or "" for My Songs> <songs json> [sync]
+  local pl=$1 out n fresh
+  local fresh_filter='([target] | add // []) as $have
+    | (if $sync == "" then [] else [.playlists[] | select(.id == $pl) | .removed // [] | .[]] end) as $gone
+    | [$new[0][] | select(.id | IN($have[].id, $gone[]) | not)]'
+  out=$(jq -r --arg pl "$pl" --arg sync "${3:-}" --slurpfile new <(printf '%s' "$2") \
+          "$TARGET $fresh_filter"' | "\(length)\t\(tojson)"' "$lib") || return 1
+  IFS=$'\t' read -r n fresh <<<"$out"
+  ((n == 0)) || update_lib --arg pl "$pl" --arg sync "${3:-}" --slurpfile new <(printf '%s' "$fresh") \
+    "$TARGET ($fresh_filter) as \$fresh | target += \$fresh" || return 1
+  echo "$n"
+}
+
+pl_import() {
+  local url=$1 list data id
+  list=$(real_list "$url")
+  [[ -z $list ]] && fail "That isn't a YouTube playlist link"
+  id="pl-$list"
+  pl_exists "$id" && { pl_sync "$id"; return; }
+  data=$(fetch_playlist "$list")
+  [[ -z $data || $(jq '.songs | length' <<<"$data") == 0 ]] && fail "Couldn't load that playlist (private or empty?)"
+  update_lib --arg id "$id" --arg src "https://www.youtube.com/playlist?list=$list" --slurpfile d <(printf '%s' "$data") \
+    '.playlists += [{id: $id, name: $d[0].title, source: $src, items: $d[0].songs}]' || fail "$SAVE_FAILED"
+  reply true "Imported \"$(jq -r .title <<<"$data")\" ($(jq '.songs | length' <<<"$data") songs)"
+}
+
+pl_sync() {
+  local id=$1 src list songs n
+  src=$(jq -r --arg id "$id" '.playlists[] | select(.id == $id) | .source // ""' "$lib")
+  [[ -z $src ]] && fail "This playlist was made here, so there's nothing to sync"
+  list=$(list_id "$src")
+  songs=$(fetch_playlist "$list" | jq -c '.songs')
+  [[ -z $songs ]] && fail "Couldn't reach that playlist on YouTube"
+  n=$(append_songs "$id" "$songs" sync) || fail "$SAVE_FAILED"
+  reply true "Synced: $n new"
+}
+
+ch_add() {
+  local url=$1 vid info id name
+  vid=$(video_id "$url")
+  if [[ -n $vid ]]; then # a video link: save the channel that posted it
+    url=$(yt-dlp --no-playlist --print channel_url -- "https://www.youtube.com/watch?v=$vid" 2>/dev/null)
+  fi
+  [[ $url == http* ]] || url="https://$url"
+  url=${url%%[?#]*} # share links add ?si=…, which would hide the /videos tab
+  url=${url%/}
+  url=${url%/videos}; url=${url%/featured}; url=${url%/streams}; url=${url%/shorts}
+  [[ $url =~ ^https://(www\.|m\.)?youtube\.com/[^[:space:]]+$ ]] || fail "Paste a YouTube channel link (youtube.com/@name)"
+  info=$(yt-dlp --flat-playlist --playlist-end 1 -J -- "$url/videos" 2>/dev/null)
+  name=$(jq -r '.channel // .uploader // .title // empty' <<<"$info" 2>/dev/null)
+  name=${name% - Videos}
+  [[ -z $name ]] && fail "Couldn't find that channel"
+  id="ch-$(jq -r '.channel_id // .id // empty' <<<"$info")"
+  jq -e --arg id "$id" '.channels | any(.id == $id)' "$lib" >/dev/null && fail "Already added"
+  update_lib --arg id "$id" --arg name "$name" --arg url "$url" '.channels += [{id: $id, name: $name, url: $url}]' ||
+    fail "$SAVE_FAILED"
+  reply true "Added channel \"$name\""
+}
+
+# Starter playlists ship in catalog.json next to this script and are merged
+# whenever that file changes: new playlists and songs are added, songs the
+# catalog drops are taken out (and a starter playlist the catalog drops goes
+# too, unless the user added songs to it). .catalog remembers what the last
+# merge offered, and every starter song or playlist the user deleted, so those
+# stay deleted even if the catalog drops and later restores them.
+catalog_merge() {
+  jq -e '.version and (.playlists | type == "array")' "$catalog" >/dev/null 2>&1 || fail "No starter playlists"
+  jq -e --slurpfile c "$catalog" '.catalog.version == $c[0].version' "$lib" >/dev/null && { reply true "Up to date"; return; }
+  update_lib --slurpfile c "$catalog" '
+    $c[0] as $cat
+    | (.catalog // {}) as $done
+    | ($done.seen // []) as $seen
+    | ($done.playlists // []) as $offered
+    | [.playlists[] | .id as $pl | .items[] | "\($pl)/\(.id)"] as $kept
+    | [.playlists[].id] as $keptPl
+    | (($done.deleted // []) + [$seen[] | select(IN($kept[]) | not)] | unique) as $deleted
+    | (($done.deletedPlaylists // []) + [$offered[] | select(IN($keptPl[]) | not)] | unique) as $deletedPl
+    | [$cat.playlists[].id] as $ids
+    | [$cat.playlists[] | .id as $pl | .items[] | "\($pl)/\(.id)"] as $now
+    | .playlists |= map(
+        if (.id | IN($offered[])) and (.id | IN($ids[]) | not) then
+          .id as $pl | .items |= map(select("\($pl)/\(.id)" | IN($seen[]) | not)) | select(.items != [])
+        else . end)
+    | reduce $cat.playlists[] as $p (.;
+        [$p.items[] | select("\($p.id)/\(.id)" | IN($seen[], $deleted[]) | not)] as $new
+        | if any(.playlists[]; .id == $p.id) then
+            (.playlists[] | select(.id == $p.id) | .items) |=
+              (map(select("\($p.id)/\(.id)" as $k | ($k | IN($seen[])) and ($k | IN($now[]) | not) | not))
+               | . as $have | . + [$new[] | select(.id | IN($have[].id) | not)])
+          elif $p.id | IN($deletedPl[]) then .
+          else .playlists += [{id: $p.id, name: $p.name, source: "", items: $new}]
+          end)
+    | .catalog = {version: $cat.version, seen: $now, playlists: $ids, deleted: $deleted, deletedPlaylists: $deletedPl}' ||
+    fail "$SAVE_FAILED"
+  reply true "Starter playlists updated"
+}
+
+# Quit any mpv on our socket, including one that lost it, and wait for it to
+# exit: a quitting mpv deletes its socket path, which may be the new player's.
+# The pattern only matches a command line that starts with mpv.
+stop_mpv() {
+  local pattern="^([^ ]*/)?mpv .*--input-ipc-server=${sock//./[.]}( |\$)"
+  if pkill -f -- "$pattern"; then
+    for _ in {1..40}; do pgrep -f -- "$pattern" >/dev/null || break; sleep 0.05; done
+    pkill -KILL -f -- "$pattern"
+  fi
+  rm -f "$sock"
+}
+
+start_mpv() { # <start index> <context json>; playlist already written to $m3u
+  stop_mpv
+  echo "$2" >"$ctx"
+  # The lock descriptors are closed so mpv can't hold them for its lifetime.
+  setsid mpv --no-video --no-terminal --idle=no --loop-playlist=inf \
+    --ytdl-format=bestaudio/best --input-ipc-server="$sock" --title=christian-focus \
+    --script="$here/player.lua" --script-opts-append=christian_focus-backend="$here/christian-focus" \
+    --playlist="$m3u" --playlist-start="$1" </dev/null >/dev/null 2>&1 8>&- 9>&- &
+  # Keep the player lock until mpv listens, so a quick second click finds it.
+  for _ in {1..60}; do [[ -S $sock ]] && return; sleep 0.05; done
+}
+
+play() {
+  local kind=${1:-songs} id=${2:-} song=${3:-} name urls start
+  case "$kind" in
+  songs) name="My Songs"; song=$id; id="" ;;
+  playlist)
+    pl_exists "$id" || fail "That playlist is gone"
+    name=$(jq -r --arg id "$id" '.playlists[] | select(.id == $id) | .name' "$lib")
+    ;;
+  channel)
+    local url
+    url=$(jq -r --arg id "$id" '.channels[] | select(.id == $id) | .url' "$lib")
+    name=$(jq -r --arg id "$id" '.channels[] | select(.id == $id) | .name' "$lib")
+    [[ -z $url ]] && fail "That channel is gone"
+    { echo '#EXTM3U'
+      yt-dlp --flat-playlist --playlist-end 150 --print 'https://www.youtube.com/watch?v=%(id)s' -- "$url/videos" 2>/dev/null | shuf
+    } >"$m3u"
+    (($(wc -l <"$m3u") < 2)) && fail "Couldn't load videos from $name"
+    start_mpv 0 "$(jq -cn --arg id "$id" --arg name "$name" '{kind: "channel", id: $id, name: $name}')"
+    reply true "Shuffling $name"
+    return
+    ;;
+  *) fail "Unknown source" ;;
+  esac
+  urls=$(jq -r --arg pl "$id" "$TARGET"' [target] | add // [] | .[].url' "$lib")
+  [[ -z $urls ]] && fail "Nothing to play yet, add a song first"
+  start=0
+  [[ -n $song ]] && start=$(jq --arg pl "$id" --arg s "$song" "$TARGET"' [target] | add // [] | map(.id) | index($s) // 0' "$lib")
+  printf '#EXTM3U\n%s\n' "$urls" >"$m3u"
+  start_mpv "$start" "$(jq -cn --arg kind "$kind" --arg id "$id" --arg name "$name" '{kind: $kind, id: $id, name: $name}')"
+  reply true "Playing $name"
+}
+
+# What toggle starts when nothing is playing: the last thing played (stop keeps
+# it in $ctx), else My Songs, else the first playlist with songs.
+resume_target() {
+  jq -r --slurpfile c <(cat "$ctx" 2>/dev/null || echo null) '
+    ($c[0] // {}) as $l
+    | [ (select($l.kind == "songs" and (.items | length) > 0) | "songs"),
+        (select($l.kind == "playlist") | .playlists[] | select(.id == $l.id and (.items | length) > 0) | "playlist \(.id)"),
+        (select($l.kind == "channel") | .channels[] | select(.id == $l.id) | "channel \(.id)"),
+        (select((.items | length) > 0) | "songs"),
+        (.playlists[] | select((.items | length) > 0) | "playlist \(.id)") ] | first // ""' "$lib" 2>/dev/null
+}
+
+cmd=${1:-state}; shift || true
+case "$cmd" in
+play | toggle | next | prev | stop) # one at a time, so two quick clicks can't start two players
+  exec 8>"$plock"; flock -w 20 8 || fail "The player is busy, try again" ;;
+esac
+case "$cmd" in
+next | prev | stop | toggle) ;; # a damaged library must not block pausing
+*)
+  [[ -s $lib ]] || echo '{}' >"$lib"
+  jq -e '(.items | type) == "array" and (.playlists | type) == "array" and (.channels | type) == "array"' "$lib" >/dev/null 2>&1 ||
+    update_lib '.items //= [] | .playlists //= [] | .channels //= []' ||
+    fail "Can't read your library ($lib). Fix or delete that file to start fresh."
+  ;;
+esac
+
+case "$cmd" in
+library) jq -c '{items, playlists, channels, welcomed: (.welcomed // false)}' "$lib" ;;
+catalog) catalog_merge ;;
+welcome)
+  update_lib --argjson drop "$(jq -cn '$ARGS.positional' --args "$@")" \
+    '.welcomed = true | .playlists |= map(select(.id | IN($drop[]) | not))' || fail "$SAVE_FAILED"
+  reply true "ok"
+  ;;
+add)
+  url=$(trim "${1:-}")
+  [[ -z $url ]] && fail "Paste a YouTube link first"
+  if [[ -n $(real_list "$url") && -z $(video_id "$url") ]]; then pl_import "$url"; exit; fi
+  vid=$(video_id "$url")
+  [[ -z $vid ]] && fail "That doesn't look like a YouTube song link"
+  songs=$(fetch_video "$vid")
+  [[ -z $songs || $songs == "[]" ]] && fail "Couldn't load that video (private or unavailable?)"
+  n=$(append_songs "" "$songs") || fail "$SAVE_FAILED"
+  reply true "$(count_msg "$n")"
+  ;;
+remove) update_lib --arg id "${1:-}" '.items |= map(select(.id != $id))' || fail "$SAVE_FAILED"; reply true "Removed" ;;
+pl-new)
+  name=$(trim "${1:-}")
+  [[ -z $name ]] && fail "Type a name for the playlist"
+  update_lib --arg id "pl-$(date +%s%N)" --arg name "$name" '.playlists += [{id: $id, name: $name, source: "", items: []}]' ||
+    fail "$SAVE_FAILED"
+  reply true "Created \"$name\""
+  ;;
+pl-import) pl_import "$(trim "${1:-}")" ;;
+pl-add)
+  id=${1:-}; url=$(trim "${2:-}")
+  pl_exists "$id" || fail "That playlist is gone"
+  songs=$(songs_from_url "$url")
+  [[ -z $songs || $songs == "[]" ]] && fail "Couldn't load that link"
+  n=$(append_songs "$id" "$songs") || fail "$SAVE_FAILED"
+  reply true "$(count_msg "$n")"
+  ;;
+pl-del) # an imported playlist remembers the removal, so syncing doesn't bring the song back
+  update_lib --arg pl "${1:-}" --arg id "${2:-}" '(.playlists[] | select(.id == $pl)) |=
+    (.items |= map(select(.id != $id)) | if (.source // "") != "" then .removed = ((.removed // []) + [$id] | unique) else . end)' ||
+    fail "$SAVE_FAILED"
+  reply true "Removed"
+  ;;
+pl-sync) pl_sync "${1:-}" ;;
+pl-remove) update_lib --arg id "${1:-}" '.playlists |= map(select(.id != $id))' || fail "$SAVE_FAILED"; reply true "Playlist deleted" ;;
+ch-add) ch_add "$(trim "${1:-}")" ;;
+ch-remove) update_lib --arg id "${1:-}" '.channels |= map(select(.id != $id))' || fail "$SAVE_FAILED"; reply true "Channel removed" ;;
+play) play "$@" ;;
+toggle)
+  if running; then ipc '{"command":["cycle","pause"]}' >/dev/null; reply true "ok"
+  else
+    target=$(resume_target)
+    [[ -z $target ]] && fail "Nothing to play yet, add a song first"
+    play $target # "songs", "playlist <id>" or "channel <id>"; ids have no spaces
+  fi
+  ;;
+next) ipc '{"command":["playlist-next"]}' >/dev/null; reply true "ok" ;;
+prev) ipc '{"command":["playlist-prev"]}' >/dev/null; reply true "ok" ;;
+stop) stop_mpv; reply true "Stopped" ;;
+*) reply false "Unknown command: $cmd" ;;
+esac

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "podzpau.christian-focus",
+  "name": "Christian-Focus",
+  "version": "1.0.0",
+  "author": "podzpau",
+  "description": "Calm Christian music for focused work, played audio-only from the bar: starter playlists plus your own YouTube songs, playlists and channels.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Christian-Focus",
+    "description": "Play calm Christian music from the bar: starter playlists plus your own YouTube songs, playlists and channels.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
