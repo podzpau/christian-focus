@@ -42,7 +42,7 @@ o.bind("SUPER + ALT + P", "Christian-Focus", "omarchy-shell christian-focus play
 ## Update
 
 ```sh
-omarchy plugin update podzpau.christian-focus
+omarchy plugin update christian-focus
 omarchy restart shell
 ```
 
@@ -53,7 +53,7 @@ Restarting the bar loads the new version; your music keeps playing. Updates can 
 Stop the music first (■ in the panel), then:
 
 ```sh
-omarchy plugin remove podzpau.christian-focus
+omarchy plugin remove christian-focus
 ```
 
 If you forget, the music stops by itself within two minutes. Your library stays in `~/.config/omarchy/christian-focus.json` in case you reinstall. Delete that file to start fresh.

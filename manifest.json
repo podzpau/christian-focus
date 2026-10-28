@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "podzpau.christian-focus",
+  "id": "christian-focus",
   "name": "Christian-Focus",
   "version": "1.0.0",
   "author": "podzpau",
@@ -17,5 +17,6 @@
     "category": "Media",
     "allowMultiple": false,
     "defaultSection": "right"
-  }
+  },
+  "license": "MIT"
 }
