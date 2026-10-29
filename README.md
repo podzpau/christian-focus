@@ -74,10 +74,6 @@ Christian-Focus plays links. It hosts no audio and copies none, and every record
 
 If you made something in the starter playlists and want it taken out, [open a removal request](https://github.com/podzpau/christian-focus/issues/new?template=removal-request.md). It's taken out in the next update, and it leaves each listener's library when they update.
 
-## Suggest a song
-
-Know a long, calm, human-made Christian piece that belongs here? [Suggest it](https://github.com/podzpau/christian-focus/issues/new?template=suggest-a-song.md). Links must come from the people who made the music, not re-uploads.
-
 ## License
 
 The code is under the [MIT License](LICENSE). Each recording keeps its own license; see [CREDITS.md](CREDITS.md).
