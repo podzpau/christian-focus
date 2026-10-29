@@ -1,5 +1,7 @@
 # Christian-Focus
 
+![A glowing cross on a forested hill in Omarchy's Osaka Jade colors, under a bar showing the Christian-Focus player](assets/banner.png)
+
 Christian focus music player for your Omarchy.
 
 Christian-Focus is a small player in the top bar. It plays the audio from YouTube or freely licensed recordings without opening a window, to prevent distractions.
