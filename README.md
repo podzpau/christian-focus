@@ -1,12 +1,12 @@
 # Christian-Focus
 
-Calm Christian music for focused work, played from your Omarchy bar.
+Christian focus music player for your Omarchy.
 
-Christian-Focus puts a small player in the top bar. It plays the audio of YouTube videos and freely licensed recordings without opening a window, so nothing competes for your attention.
+Christian-Focus is a small player in the top bar. It plays the audio from YouTube or freely licensed recordings without opening a window, to prevent distractions.
 
-- **Eight starter playlists**, mostly hour-long mixes: Gregorian chant, sacred polyphony, instrumental hymns, Marian hymns, Eastern and Byzantine chant, organ, Taizé and Catholic lofi.
-- **Your own music, too.** Paste a YouTube song, playlist or channel link to add it.
-- **Picked by hand.** AI-generated music was left out wherever we could tell.
+- **Eight sample playlists of longer mixes:** Gregorian chants, sacred polyphony, instrumental hymns, Marian hymns, Eastern and Byzantine chant, organ, Taizé and Catholic lofi.
+- **Create your own:** paste a link, then create a playlist or add it to an existing category.
+- **Carefully selected:** we tried our best to remove AI-generated music.
 
 ## Install
 
